@@ -1,0 +1,6 @@
+Noto Sans is licensed under the SIL Open Font License, Version 1.1.
+
+  https://openfontlicense.org/
+
+It is included here as a test fixture only: the renderer ships no font, and a template pins
+the font asset a household uploaded. Nothing in this repository's released image contains it.
