@@ -1,0 +1,25 @@
+[package]
+name = "victual-label-renderer"
+version = "0.1.0"
+edition = "2021"
+license = "BSD-3-Clause"
+description = "Headless label renderer for Victual"
+
+[dependencies]
+resvg = "0.45"
+usvg = "0.45"
+tiny-skia = "0.11"
+fontdb = "0.23"
+ttf-parser = "0.25"
+serde_json = "1"
+ureq = { version = "2", default-features = false, features = ["json", "tls"] }
+base64 = "0.22"
+flate2 = "1"
+crc32fast = "1"
+
+[profile.release]
+opt-level = "z"
+lto = true
+strip = true
+codegen-units = 1
+panic = "abort"
