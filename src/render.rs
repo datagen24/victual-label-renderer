@@ -18,7 +18,9 @@
 //! set `canvas.orientation_deg` to 0, 90, 180 or 270. Its elements are positioned in the
 //! reading frame; canvas `width_mm` stays the roll's width and `height_mm` the length along
 //! the tape. The reading frame is rendered with each axis at the dpi of the physical axis it
-//! will become, then turned clockwise onto the raster by `turn`, an exact permutation.
+//! will become, then turned clockwise onto the raster by `turn_pixmap`, an exact permutation. A schema 2 element may
+//! carry `rotation_deg` too: it is painted in its own frame the same way, turned by the same
+//! permutation, and placed with its footprint's top-left corner at (`x_mm`, `y_mm`).
 
 use serde_json::Value;
 
@@ -107,6 +109,17 @@ pub fn render(input: &Value, assets: &[(String, Vec<u8>)], _version: &str) -> Re
     let permits_red = palette.iter().any(|c| *c == [0xff, 0x00, 0x00]);
 
     let elements = document["elements"].as_array().ok_or_else(|| fail("UNSUPPORTED_VERSION", None, "no elements"))?;
+    for element in elements {
+        if let Some(value) = element.get("rotation_deg") {
+            let id = element["id"].as_str();
+            if schema != Some(2) {
+                return Err(fail("UNSUPPORTED_VERSION", id, "rotation_deg needs template schema_version 2"));
+            }
+            if !matches!(value.as_i64(), Some(0 | 90 | 180 | 270)) || element["type"] == "line" {
+                return Err(fail("UNSUPPORTED_VERSION", id, "rotation_deg is one of 0, 90, 180 and 270, on a text, qr, image or rect element"));
+            }
+        }
+    }
     let fields = &input["capture"]["fields"];
 
     let mut fontdb = fontdb::Database::new();
@@ -161,6 +174,9 @@ pub fn render(input: &Value, assets: &[(String, Vec<u8>)], _version: &str) -> Re
             }
         }
 
+        // A turned text box runs along whichever axis it was turned onto, so it is measured
+        // at that axis's dpi: the same frame swap as a turned canvas, one element at a time.
+        let geometry = &local(&geometry, rotation_of(element));
         let mut size_pt = number(element, "size_pt");
         let minimum = element["min_size_pt"].as_f64().map(|v| v as f32);
         let overflow = element["overflow"].as_str().unwrap_or("error");
@@ -202,6 +218,9 @@ pub fn render(input: &Value, assets: &[(String, Vec<u8>)], _version: &str) -> Re
     for element in elements {
         let id = element["id"].as_str().unwrap_or("element");
         let colour = colour_of(element, "color", permits_red).map_err(|e| fail("MEDIA_INCOMPATIBLE", Some(id), e))?;
+        if rotation_of(element) != 0 || element["type"] == "text" {
+            continue;
+        }
         match element["type"].as_str().unwrap_or_default() {
             "qr" => paint_qr(&mut pixmap, &geometry, element, input, colour)?,
             "rect" => paint_rect(&mut pixmap, &geometry, element, colour, permits_red)?,
@@ -211,15 +230,57 @@ pub fn render(input: &Value, assets: &[(String, Vec<u8>)], _version: &str) -> Re
         }
     }
 
-    if !laid_out.is_empty() {
-        let svg = text_svg(&geometry, height, elements, &laid_out, &families, fields, permits_red)?;
-        let mut options = usvg::Options::default();
-        options.fontdb = std::sync::Arc::new(fontdb);
-        let tree = usvg::Tree::from_str(&svg, &options).map_err(|e| fail("RENDER_FAILED", None, e.to_string()))?;
-        resvg::render(&tree, tiny_skia::Transform::identity(), &mut pixmap.as_mut());
+    let fontdb = std::sync::Arc::new(fontdb);
+    let upright: Vec<(usize, Vec<String>, f32, f32)> = laid_out.iter()
+        .filter(|(index, ..)| rotation_of(&elements[*index]) == 0)
+        .cloned().collect();
+    if !upright.is_empty() {
+        let svg = text_svg(&geometry, height, elements, &upright, &families, fields, permits_red)?;
+        draw_svg(&mut pixmap, &svg, &fontdb)?;
     }
 
-    let pixmap = turn(&pixmap, orientation)
+    // Turned elements, in document order: each is painted at the origin of its own frame,
+    // turned by the same exact permutation as the canvas, and composited with its footprint's
+    // top-left corner at (x_mm, y_mm).
+    for (index, element) in elements.iter().enumerate() {
+        let turn = rotation_of(element);
+        if turn == 0 {
+            continue;
+        }
+        let id = element["id"].as_str().unwrap_or("element");
+        let colour = colour_of(element, "color", permits_red).map_err(|e| fail("MEDIA_INCOMPATIBLE", Some(id), e))?;
+        let mut frame = local(&geometry, turn);
+        let mut at_origin = element.clone();
+        at_origin["x_mm"] = Value::from(0.0);
+        at_origin["y_mm"] = Value::from(0.0);
+        let (w, h) = local_size(&frame, element, input);
+        frame.width = w;
+        let mut piece = tiny_skia::Pixmap::new(w.max(1), h.max(1))
+            .ok_or_else(|| fail("RENDER_FAILED", Some(id), "pixmap allocation failed"))?;
+        match element["type"].as_str().unwrap_or_default() {
+            "qr" => paint_qr(&mut piece, &frame, &at_origin, input, colour)?,
+            "rect" => paint_rect(&mut piece, &frame, &at_origin, colour, permits_red)?,
+            "image" => paint_image(&mut piece, &frame, &at_origin, assets, colour)?,
+            "text" => {
+                let (_, lines, size_pt, spacing) = laid_out.iter().find(|(i, ..)| *i == index)
+                    .ok_or_else(|| fail("RENDER_FAILED", Some(id), "the text was not laid out"))?;
+                let line_height = size_pt * frame.dpi_y / POINTS_PER_INCH * spacing;
+                if line_height * lines.len() as f32 > h as f32 + 0.5 {
+                    return Err(fail("TEXT_OVERFLOW", Some(id), format!("{} lines do not fit a turned {:.1} mm box", lines.len(), number(element, "height_mm"))));
+                }
+                let one = [at_origin];
+                let svg = text_svg(&frame, h, &one, &[(0, lines.clone(), *size_pt, *spacing)], &families, fields, permits_red)?;
+                draw_svg(&mut piece, &svg, &fontdb)?;
+            }
+            _ => {}
+        }
+        let piece = turn_pixmap(&piece, turn).ok_or_else(|| fail("RENDER_FAILED", Some(id), "pixmap allocation failed"))?;
+        pixmap.draw_pixmap(
+            geometry.x(number(element, "x_mm")) as i32, geometry.y(number(element, "y_mm")) as i32,
+            piece.as_ref(), &tiny_skia::PixmapPaint::default(), tiny_skia::Transform::identity(), None);
+    }
+
+    let pixmap = turn_pixmap(&pixmap, orientation)
         .ok_or_else(|| fail("RENDER_FAILED", None, "pixmap allocation failed"))?;
     let indices = quantise(&pixmap, &palette, profile);
     let bytes = png::encode(pixmap.width(), pixmap.height(), &indices, &palette)
@@ -228,12 +289,55 @@ pub fn render(input: &Value, assets: &[(String, Vec<u8>)], _version: &str) -> Re
     Ok(Rendered { bytes, width: pixmap.width(), height: pixmap.height() })
 }
 
+/// An element's clockwise turn; 0 when it states none.
+fn rotation_of(element: &Value) -> u32 {
+    element["rotation_deg"].as_u64().unwrap_or(0) as u32
+}
+
+/// The frame a turned element is laid out in: on a quarter turn its own x lands on the
+/// surrounding y, so it takes that axis's dpi.
+fn local(geometry: &Geometry, turn: u32) -> Geometry {
+    if turn == 90 || turn == 270 {
+        Geometry { dpi_x: geometry.dpi_y, dpi_y: geometry.dpi_x, width: geometry.width }
+    } else {
+        Geometry { dpi_x: geometry.dpi_x, dpi_y: geometry.dpi_y, width: geometry.width }
+    }
+}
+
+/// An element's unturned size in pixels of its own frame.
+fn local_size(frame: &Geometry, element: &Value, input: &Value) -> (u32, u32) {
+    if element["type"] == "qr" {
+        let id = element["id"].as_str().unwrap_or("qr");
+        let size = input["qr"][id]["modules"].as_array().map_or(0, Vec::len) as u32;
+        let quiet = element["quiet_zone_modules"].as_u64().unwrap_or(4) as u32;
+        let module_mm = number(element, "module_mm");
+        let span = size + 2 * quiet;
+        return (span * frame.x(module_mm).max(1.0) as u32, span * frame.y(module_mm).max(1.0) as u32);
+    }
+    (frame.x(number(element, "width_mm")) as u32, frame.y(number(element, "height_mm")) as u32)
+}
+
+/// A turned element's footprint in the surrounding frame: width and height swap on a quarter turn.
+fn footprint(geometry: &Geometry, element: &Value, input: &Value) -> (u32, u32) {
+    let turn = rotation_of(element);
+    let (w, h) = local_size(&local(geometry, turn), element, input);
+    if turn == 90 || turn == 270 { (h, w) } else { (w, h) }
+}
+
+fn draw_svg(pixmap: &mut tiny_skia::Pixmap, svg: &str, fontdb: &std::sync::Arc<fontdb::Database>) -> Result<(), Fail> {
+    let mut options = usvg::Options::default();
+    options.fontdb = fontdb.clone();
+    let tree = usvg::Tree::from_str(svg, &options).map_err(|e| fail("RENDER_FAILED", None, e.to_string()))?;
+    resvg::render(&tree, tiny_skia::Transform::identity(), &mut pixmap.as_mut());
+    Ok(())
+}
+
 /// Turns the reading-frame pixmap clockwise by `degrees` onto the physical raster.
 ///
 /// The convention Victual's verifier and editor implement too: reading pixel (x, y) of a
 /// W x H reading image lands at physical (H-1-y, x) for 90, (W-1-x, H-1-y) for 180 and
 /// (y, W-1-x) for 270. An exact permutation of pixels, so nothing is resampled.
-fn turn(source: &tiny_skia::Pixmap, degrees: u32) -> Option<tiny_skia::Pixmap> {
+fn turn_pixmap(source: &tiny_skia::Pixmap, degrees: u32) -> Option<tiny_skia::Pixmap> {
     if degrees == 0 {
         return Some(source.clone());
     }
@@ -271,11 +375,19 @@ fn canvas_height(document: &Value, profile: &Value, geometry: &Geometry, element
     let mut bottom: f32 = 0.0;
     for (index, lines, size_pt, spacing) in laid_out {
         let element = &elements[*index];
+        if rotation_of(element) != 0 {
+            continue;
+        }
         let top = geometry.y(number(element, "y_mm"));
         let line_height = size_pt * geometry.dpi_y / POINTS_PER_INCH * spacing;
         bottom = bottom.max(top + line_height * lines.len() as f32);
     }
     for element in elements {
+        if rotation_of(element) != 0 {
+            let (_, h) = footprint(geometry, element, input);
+            bottom = bottom.max(geometry.y(number(element, "y_mm")) + h as f32);
+            continue;
+        }
         match element["type"].as_str().unwrap_or_default() {
             // The symbol and both quiet zones, in the same whole-pixel steps paint_qr uses,
             // so the canvas is never a pixel short of the symbol it is sized for. Leaving a
@@ -310,6 +422,11 @@ fn canvas_length_across(document: &Value, profile: &Value, geometry: &Geometry, 
     } else {
         let mut right: f32 = 0.0;
         for element in elements {
+            if rotation_of(element) != 0 {
+                let (w, _) = footprint(geometry, element, input);
+                right = right.max(geometry.x(number(element, "x_mm")) + w as f32);
+                continue;
+            }
             match element["type"].as_str().unwrap_or_default() {
                 "qr" => right = right.max(qr_right(geometry, element, input) as f32),
                 "line" => right = right.max(geometry.x(number(element, "x1_mm")).max(geometry.x(number(element, "x2_mm")))),
