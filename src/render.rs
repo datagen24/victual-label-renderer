@@ -13,6 +13,12 @@
 //! advance of the very text node that will be rendered. Measuring with `hmtx` advances and
 //! painting with a shaper is what diverged by up to 5.77% on kerning-heavy strings, and
 //! summing advances is not what shaping produces.
+//!
+//! **Orientation turns pixels, never outlines at the wrong scale.** A schema 2 document may
+//! set `canvas.orientation_deg` to 0, 90, 180 or 270. Its elements are positioned in the
+//! reading frame; canvas `width_mm` stays the roll's width and `height_mm` the length along
+//! the tape. The reading frame is rendered with each axis at the dpi of the physical axis it
+//! will become, then turned clockwise onto the raster by `turn`, an exact permutation.
 
 use serde_json::Value;
 
@@ -59,18 +65,38 @@ pub fn render(input: &Value, assets: &[(String, Vec<u8>)], _version: &str) -> Re
     let document = input.get("document").ok_or_else(|| fail("UNSUPPORTED_VERSION", None, "no document"))?;
     let profile = input.get("profile").ok_or_else(|| fail("MEDIA_INCOMPATIBLE", None, "no profile"))?;
 
-    if document.get("schema_version").and_then(Value::as_i64) != Some(1) {
-        return Err(fail("UNSUPPORTED_VERSION", None, "only template schema_version 1 is understood"));
+    let schema = document.get("schema_version").and_then(Value::as_i64);
+    if schema != Some(1) && schema != Some(2) {
+        return Err(fail("UNSUPPORTED_VERSION", None, "only template schema_version 1 and 2 are understood"));
     }
+    let orientation = match (schema, document["canvas"].get("orientation_deg")) {
+        (_, None) => 0,
+        (Some(2), Some(value)) => match value.as_i64() {
+            Some(degrees @ (0 | 90 | 180 | 270)) => degrees as u32,
+            _ => return Err(fail("UNSUPPORTED_VERSION", None, "orientation_deg is one of 0, 90, 180 and 270")),
+        },
+        _ => return Err(fail("UNSUPPORTED_VERSION", None, "orientation_deg needs template schema_version 2")),
+    };
 
-    let geometry = Geometry {
+    let physical = Geometry {
         dpi_x: number(profile, "dpi_x"),
         dpi_y: number(profile, "dpi_y"),
         width: number(profile, "raster_width_px") as u32,
     };
-    if geometry.width == 0 || geometry.dpi_x <= 0.0 || geometry.dpi_y <= 0.0 {
+    if physical.width == 0 || physical.dpi_x <= 0.0 || physical.dpi_y <= 0.0 {
         return Err(fail("MEDIA_INCOMPATIBLE", None, "the profile fixes no usable pixel grid"));
     }
+
+    // Everything below is laid out and painted in the reading frame, the design as somebody
+    // reads it. On a quarter turn, reading x lands on the tape's length and reading y on the
+    // roll's width, so each reading axis takes the dpi of the physical axis it becomes: the
+    // outlines are scaled for the device before the pixels are turned, never after.
+    let quarter = orientation == 90 || orientation == 270;
+    let mut geometry = if quarter {
+        Geometry { dpi_x: physical.dpi_y, dpi_y: physical.dpi_x, width: 0 }
+    } else {
+        Geometry { dpi_x: physical.dpi_x, dpi_y: physical.dpi_y, width: physical.width }
+    };
 
     let palette: Vec<[u8; 3]> = profile["pixel_policy"]["palette"]
         .as_array()
@@ -160,7 +186,12 @@ pub fn render(input: &Value, assets: &[(String, Vec<u8>)], _version: &str) -> Re
         laid_out.push((index, lines, used, number(element, "line_spacing")));
     }
 
-    let height = canvas_height(document, profile, &geometry, elements, &laid_out, input)?;
+    let height = if quarter {
+        geometry.width = canvas_length_across(document, profile, &geometry, &physical, elements, input)?;
+        physical.width
+    } else {
+        canvas_height(document, profile, &geometry, elements, &laid_out, input)?
+    };
 
     // Non-text elements are painted directly, so a QR module lands on exactly the pixels
     // Victual will sample. Text goes through resvg afterwards and composites over them.
@@ -188,11 +219,40 @@ pub fn render(input: &Value, assets: &[(String, Vec<u8>)], _version: &str) -> Re
         resvg::render(&tree, tiny_skia::Transform::identity(), &mut pixmap.as_mut());
     }
 
+    let pixmap = turn(&pixmap, orientation)
+        .ok_or_else(|| fail("RENDER_FAILED", None, "pixmap allocation failed"))?;
     let indices = quantise(&pixmap, &palette, profile);
-    let bytes = png::encode(geometry.width, height, &indices, &palette)
+    let bytes = png::encode(pixmap.width(), pixmap.height(), &indices, &palette)
         .map_err(|e| fail("RENDER_FAILED", None, e))?;
 
-    Ok(Rendered { bytes, width: geometry.width, height })
+    Ok(Rendered { bytes, width: pixmap.width(), height: pixmap.height() })
+}
+
+/// Turns the reading-frame pixmap clockwise by `degrees` onto the physical raster.
+///
+/// The convention Victual's verifier and editor implement too: reading pixel (x, y) of a
+/// W x H reading image lands at physical (H-1-y, x) for 90, (W-1-x, H-1-y) for 180 and
+/// (y, W-1-x) for 270. An exact permutation of pixels, so nothing is resampled.
+fn turn(source: &tiny_skia::Pixmap, degrees: u32) -> Option<tiny_skia::Pixmap> {
+    if degrees == 0 {
+        return Some(source.clone());
+    }
+    let (w, h) = (source.width(), source.height());
+    let (tw, th) = if degrees == 180 { (w, h) } else { (h, w) };
+    let mut target = tiny_skia::Pixmap::new(tw, th)?;
+    let from = source.pixels();
+    let to = target.pixels_mut();
+    for y in 0..h {
+        for x in 0..w {
+            let (px, py) = match degrees {
+                90 => (h - 1 - y, x),
+                180 => (w - 1 - x, h - 1 - y),
+                _ => (y, w - 1 - x),
+            };
+            to[(py * tw + px) as usize] = from[(y * w + x) as usize];
+        }
+    }
+    Some(target)
 }
 
 /// Content extent plus explicit spacing, bounded by the profile's length rules.
@@ -237,6 +297,38 @@ fn canvas_height(document: &Value, profile: &Value, geometry: &Geometry, element
     Ok(height)
 }
 
+/// The reading width of a quarter-turned design: the tape length, in reading pixels.
+///
+/// The twin of canvas_height for the axis that runs along the tape once the design is
+/// turned. Fixed `height_mm` is still the length along the tape, so it is measured on the
+/// reading x axis here; automatic length is the content's right edge plus the right margin,
+/// bounded the same way.
+fn canvas_length_across(document: &Value, profile: &Value, geometry: &Geometry, physical: &Geometry, elements: &[Value], input: &Value) -> Result<u32, Fail> {
+    let canvas = &document["canvas"];
+    let length = if let Some(fixed) = canvas["height_mm"].as_f64() {
+        geometry.x(fixed as f32) as u32
+    } else {
+        let mut right: f32 = 0.0;
+        for element in elements {
+            match element["type"].as_str().unwrap_or_default() {
+                "qr" => right = right.max(qr_right(geometry, element, input) as f32),
+                "line" => right = right.max(geometry.x(number(element, "x1_mm")).max(geometry.x(number(element, "x2_mm")))),
+                _ => right = right.max(geometry.x(number(element, "x_mm")) + geometry.x(number(element, "width_mm"))),
+            }
+        }
+        let margin = number(&canvas["margins_mm"], "right");
+        let length = (right + geometry.x(margin)).ceil().max(1.0) as u32;
+        let cap = canvas["max_height_mm"].as_f64().unwrap_or(0.0) as f32;
+        if cap > 0.0 && (length as f32) > geometry.x(cap) {
+            return Err(fail("MEDIA_INCOMPATIBLE", None,
+                format!("automatic length reached {:.1} mm against a max_height_mm of {cap}", length as f32 * MM_PER_INCH / geometry.dpi_x)));
+        }
+        length
+    };
+    assert_length(profile, physical, length)?;
+    Ok(length)
+}
+
 fn assert_length(profile: &Value, geometry: &Geometry, height: u32) -> Result<(), Fail> {
     let rules = &profile["length_rules"];
     let to_px = |um: f32| (um * geometry.dpi_y / 25400.0).round() as u32;
@@ -264,6 +356,15 @@ fn qr_bottom(geometry: &Geometry, element: &Value, input: &Value) -> u32 {
     let module_y = geometry.y(number(element, "module_mm")).max(1.0) as u32;
     let quiet = element["quiet_zone_modules"].as_u64().unwrap_or(4) as u32;
     geometry.y(number(element, "y_mm")) as u32 + (size + 2 * quiet) * module_y
+}
+
+/// The last pixel column a QR element occupies, its trailing quiet zone included.
+fn qr_right(geometry: &Geometry, element: &Value, input: &Value) -> u32 {
+    let id = element["id"].as_str().unwrap_or("qr");
+    let size = input["qr"][id]["modules"].as_array().map_or(0, Vec::len) as u32;
+    let module_x = geometry.x(number(element, "module_mm")).max(1.0) as u32;
+    let quiet = element["quiet_zone_modules"].as_u64().unwrap_or(4) as u32;
+    geometry.x(number(element, "x_mm")) as u32 + (size + 2 * quiet) * module_x
 }
 
 fn paint_qr(pixmap: &mut tiny_skia::Pixmap, geometry: &Geometry, element: &Value, input: &Value, colour: [u8; 3]) -> Result<(), Fail> {
