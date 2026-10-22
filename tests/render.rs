@@ -154,3 +154,20 @@ fn never_resamples_at_either_resolution() {
         assert_eq!(actual_height, (30.0 * dpi_y as f64 / 25.4).round() as u32, "{dpi_x}x{dpi_y} height");
     }
 }
+
+/// Issue #948: automatic height measured text, rects and images but skipped the QR, so a
+/// QR-only label came out as long as its bottom margin (24 px) and the media refused it.
+#[test]
+fn automatic_height_holds_the_whole_qr_symbol() {
+    let mut document = qr_document(0.5);
+    document["canvas"]["height_mm"] = serde_json::Value::Null;
+    document["canvas"]["max_height_mm"] = serde_json::json!(100.0);
+    let out = std::env::temp_dir().join("render-auto-qr.png");
+    let (code, report) = run(&input(document, "black_red"), out.to_str().unwrap());
+    assert_eq!(code, 0, "{report}");
+
+    let (_, height, _, _) = png_header(&std::fs::read(&out).unwrap());
+    // Nearest-pixel rounding: y 2 mm = 24 px; 21 modules and two 4-module quiet zones at
+    // 6 px each = 174 px; the 1 mm bottom margin adds 12 px to the 198 px extent.
+    assert_eq!(height, 210);
+}

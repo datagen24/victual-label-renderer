@@ -160,7 +160,7 @@ pub fn render(input: &Value, assets: &[(String, Vec<u8>)], _version: &str) -> Re
         laid_out.push((index, lines, used, number(element, "line_spacing")));
     }
 
-    let height = canvas_height(document, profile, &geometry, elements, &laid_out)?;
+    let height = canvas_height(document, profile, &geometry, elements, &laid_out, input)?;
 
     // Non-text elements are painted directly, so a QR module lands on exactly the pixels
     // Victual will sample. Text goes through resvg afterwards and composites over them.
@@ -200,7 +200,7 @@ pub fn render(input: &Value, assets: &[(String, Vec<u8>)], _version: &str) -> Re
 /// Never crops and never grows without a bound: continuous tape is not an unbounded canvas,
 /// so a document with automatic height states how far it may go and the media says whether
 /// that is possible at all.
-fn canvas_height(document: &Value, profile: &Value, geometry: &Geometry, elements: &[Value], laid_out: &[(usize, Vec<String>, f32, f32)]) -> Result<u32, Fail> {
+fn canvas_height(document: &Value, profile: &Value, geometry: &Geometry, elements: &[Value], laid_out: &[(usize, Vec<String>, f32, f32)], input: &Value) -> Result<u32, Fail> {
     let canvas = &document["canvas"];
     if let Some(fixed) = canvas["height_mm"].as_f64() {
         let height = geometry.y(fixed as f32) as u32;
@@ -217,7 +217,10 @@ fn canvas_height(document: &Value, profile: &Value, geometry: &Geometry, element
     }
     for element in elements {
         match element["type"].as_str().unwrap_or_default() {
-            "qr" => {}
+            // The symbol and both quiet zones, in the same whole-pixel steps paint_qr uses,
+            // so the canvas is never a pixel short of the symbol it is sized for. Leaving a
+            // QR out made a QR-only label as long as its bottom margin (issue #948).
+            "qr" => bottom = bottom.max(qr_bottom(geometry, element, input) as f32),
             "line" => bottom = bottom.max(geometry.y(number(element, "y1_mm")).max(geometry.y(number(element, "y2_mm")))),
             _ => bottom = bottom.max(geometry.y(number(element, "y_mm")) + geometry.y(number(element, "height_mm"))),
         }
@@ -252,6 +255,15 @@ fn assert_length(profile: &Value, geometry: &Geometry, height: u32) -> Result<()
         }
     }
     Ok(())
+}
+
+/// The last pixel row a QR element occupies, its trailing quiet zone included.
+fn qr_bottom(geometry: &Geometry, element: &Value, input: &Value) -> u32 {
+    let id = element["id"].as_str().unwrap_or("qr");
+    let size = input["qr"][id]["modules"].as_array().map_or(0, Vec::len) as u32;
+    let module_y = geometry.y(number(element, "module_mm")).max(1.0) as u32;
+    let quiet = element["quiet_zone_modules"].as_u64().unwrap_or(4) as u32;
+    geometry.y(number(element, "y_mm")) as u32 + (size + 2 * quiet) * module_y
 }
 
 fn paint_qr(pixmap: &mut tiny_skia::Pixmap, geometry: &Geometry, element: &Value, input: &Value, colour: [u8; 3]) -> Result<(), Fail> {
