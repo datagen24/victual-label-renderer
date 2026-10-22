@@ -256,3 +256,68 @@ fn orientation_needs_schema_version_two() {
     assert_eq!(code, 3, "{report}");
     assert_eq!(report["code"], "UNSUPPORTED_VERSION");
 }
+
+fn with_rotation(mut document: serde_json::Value, index: usize, degrees: u32) -> serde_json::Value {
+    document["schema_version"] = serde_json::json!(2);
+    document["elements"][index]["rotation_deg"] = serde_json::json!(degrees);
+    document
+}
+
+/// #1033 phase 2: a turned element is painted in its own frame, turned clockwise by the same
+/// permutation as a canvas, and placed with its footprint's top-left at (x_mm, y_mm).
+///
+/// The 29-module symbol is 203 px square at 7 px a module. Unturned in its own frame, the
+/// first module's centre is (31, 31) and its light neighbour's (38, 31). Turned 90 they land
+/// at (202 - 31, 31) = (171, 31) and (171, 38), plus the 24 px footprint origin.
+#[test]
+fn a_turned_qr_lands_where_the_convention_says() {
+    let out = std::env::temp_dir().join("render-element-90.png");
+    let (code, report) = run(&input(with_rotation(qr_document(0.6), 0, 90), "black_red"), out.to_str().unwrap());
+    assert_eq!(code, 0, "{report}");
+    assert!(dark_at(&out, 195, 55), "local (31, 31) lands at (195, 55)");
+    assert!(!dark_at(&out, 195, 62), "local (38, 31), the light neighbour, lands at (195, 62)");
+}
+
+/// A turned text box keeps its ink inside its footprint, which is its box with width and
+/// height swapped: a 20 x 6 mm box turned 90 at (2, 2) covers x 24..95 and y 24..260.
+#[test]
+fn turned_text_stays_inside_its_footprint() {
+    let font = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/NotoSans-Regular.ttf");
+    let mut document = qr_document(0.6);
+    document["schema_version"] = serde_json::json!(2);
+    document["elements"] = serde_json::json!([{
+        "type": "text", "id": "name", "x_mm": 2.0, "y_mm": 2.0, "width_mm": 20.0, "height_mm": 6.0,
+        "field": "location.name", "font_asset": "fixture", "size_pt": 11.0, "align": "left",
+        "valign": "top", "wrap": true, "line_spacing": 1.2, "overflow": "error", "color": "black",
+        "rotation_deg": 90}]);
+    let mut request = input(document, "black_red");
+    request["assets"] = serde_json::json!([{"id": 1, "name": "fixture", "file": font}]);
+    let out = std::env::temp_dir().join("render-element-text.png");
+    let (code, report) = run(&request, out.to_str().unwrap());
+    assert_eq!(code, 0, "{report}");
+
+    let pixmap = tiny_skia::Pixmap::load_png(&out).unwrap();
+    let (mut inside, mut outside) = (0, 0);
+    for y in 0..pixmap.height() {
+        for x in 0..pixmap.width() {
+            if pixmap.pixel(x, y).unwrap().red() < 128 {
+                if (24..95).contains(&x) && (24..260).contains(&y) { inside += 1 } else { outside += 1 }
+            }
+        }
+    }
+    assert!(inside > 50, "the text was drawn ({inside} dark pixels)");
+    assert_eq!(outside, 0, "no ink outside the turned footprint");
+}
+
+/// rotation_deg is schema 2, a quarter turn, and not on a line.
+#[test]
+fn element_rotation_is_refused_where_it_does_not_apply() {
+    let mut v1 = qr_document(0.6);
+    v1["elements"][0]["rotation_deg"] = serde_json::json!(90);
+    let out = std::env::temp_dir().join("render-element-refused.png");
+    let (code, report) = run(&input(v1, "black_red"), out.to_str().unwrap());
+    assert_eq!((code, report["code"].as_str()), (3, Some("UNSUPPORTED_VERSION")), "{report}");
+
+    let (code, report) = run(&input(with_rotation(qr_document(0.6), 0, 45), "black_red"), out.to_str().unwrap());
+    assert_eq!((code, report["code"].as_str()), (3, Some("UNSUPPORTED_VERSION")), "{report}");
+}
