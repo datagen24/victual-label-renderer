@@ -321,3 +321,100 @@ fn element_rotation_is_refused_where_it_does_not_apply() {
     let (code, report) = run(&input(with_rotation(qr_document(0.6), 0, 45), "black_red"), out.to_str().unwrap());
     assert_eq!((code, report["code"].as_str()), (3, Some("UNSUPPORTED_VERSION")), "{report}");
 }
+
+/// A text request on the QR fixture's canvas, holding one text box at (2, 2) mm with the given
+/// value, height and overflow rule; the box is 30 mm wide and 9 pt, as on the 2026-10-23
+/// stock label.
+fn text_request(value: &str, height_mm: f64, overflow: &str, extra: serde_json::Value) -> serde_json::Value {
+    let font = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/NotoSans-Regular.ttf");
+    let mut document = qr_document(0.6);
+    let mut element = serde_json::json!({
+        "type": "text", "id": "name", "x_mm": 2.0, "y_mm": 2.0, "width_mm": 30.0, "height_mm": height_mm,
+        "field": "location.name", "font_asset": "fixture", "size_pt": 9.0, "align": "left",
+        "valign": "top", "wrap": true, "line_spacing": 1.2, "overflow": overflow, "color": "black"});
+    for (key, value) in extra.as_object().unwrap() {
+        element[key] = value.clone();
+    }
+    document["elements"] = serde_json::json!([element]);
+    let mut request = input(document, "black_red");
+    request["capture"]["fields"]["location.name"] = serde_json::json!(value);
+    request["assets"] = serde_json::json!([{"id": 1, "name": "fixture", "file": font}]);
+    request
+}
+
+/// Dark pixels below a row, which is where text that ran out of its box lands.
+fn ink_below(path: &std::path::Path, row: u32) -> usize {
+    let pixmap = tiny_skia::Pixmap::load_png(path).unwrap();
+    let mut count = 0;
+    for y in row..pixmap.height() {
+        for x in 0..pixmap.width() {
+            if pixmap.pixel(x, y).unwrap().red() < 128 {
+                count += 1;
+            }
+        }
+    }
+    count
+}
+
+/// Capitals without descenders, long enough to need five lines, 19 mm, in a 30 mm box at 9 pt.
+const LONG: &str = "GREAT VALUE ORGANIC WHOLE PEELED TOMATOES IN TOMATO HEAT AND BASIL";
+
+/// The bottom of the (2 mm, 2 + h mm) box at 300 dpi, plus a pixel for rounding.
+fn bottom_px(height_mm: f32) -> u32 {
+    ((2.0 + height_mm) * 300.0 / 25.4).round() as u32 + 1
+}
+
+#[test]
+fn overflow_error_refuses_text_taller_than_its_box() {
+    let out = std::env::temp_dir().join("render-overflow-error.png");
+    // 2026-10-23: a value needing several lines in a 3.2 mm box were drawn over the element below.
+    let (code, report) = run(&text_request(LONG, 3.2, "error", serde_json::json!({})), out.to_str().unwrap());
+    assert_eq!((code, report["code"].as_str(), report["element"].as_str()), (3, Some("TEXT_OVERFLOW"), Some("name")), "{report}");
+    assert!(report["detail"].as_str().unwrap().contains("3.2 mm tall"), "{report}");
+
+    // One 9 pt line at 1.2 spacing advances 3.81 mm, so even a short value needs a taller box.
+    let (code, report) = run(&text_request("SALT", 3.2, "error", serde_json::json!({})), out.to_str().unwrap());
+    assert_eq!((code, report["code"].as_str()), (3, Some("TEXT_OVERFLOW")), "{report}");
+
+    let (code, report) = run(&text_request(LONG, 20.0, "error", serde_json::json!({})), out.to_str().unwrap());
+    assert_eq!(code, 0, "five lines fit 20 mm: {report}");
+    assert_eq!(ink_below(&out, bottom_px(20.0)), 0, "no ink below the box");
+}
+
+#[test]
+fn ellipsis_keeps_the_lines_that_fit_and_ends_the_last() {
+    let out = std::env::temp_dir().join("render-overflow-ellipsis.png");
+    let (code, report) = run(&text_request(LONG, 8.0, "ellipsis", serde_json::json!({})), out.to_str().unwrap());
+    assert_eq!(code, 0, "{report}");
+    assert!(ink_below(&out, 2 * 24) > 0, "text was drawn");
+    assert_eq!(ink_below(&out, bottom_px(8.0)), 0, "two lines kept, nothing below the 8 mm box");
+
+    // Not even one line fits: there is nothing to put an ellipsis on.
+    let (code, report) = run(&text_request(LONG, 3.0, "ellipsis", serde_json::json!({})), out.to_str().unwrap());
+    assert_eq!((code, report["code"].as_str()), (3, Some("TEXT_OVERFLOW")), "{report}");
+}
+
+#[test]
+fn shrink_to_fit_shrinks_for_height_as_well_as_width() {
+    let out = std::env::temp_dir().join("render-overflow-shrink.png");
+    let (code, report) = run(&text_request(LONG, 8.0, "shrink_to_fit", serde_json::json!({"min_size_pt": 4.0})), out.to_str().unwrap());
+    assert_eq!(code, 0, "{report}");
+    assert_eq!(ink_below(&out, bottom_px(8.0)), 0, "shrunk until it fits the 8 mm box");
+
+    let (code, report) = run(&text_request(LONG, 8.0, "shrink_to_fit", serde_json::json!({"min_size_pt": 8.5})), out.to_str().unwrap());
+    assert_eq!((code, report["code"].as_str(), report["element"].as_str()), (3, Some("TEXT_OVERFLOW"), Some("name")), "a floor that still overflows refuses: {report}");
+}
+
+#[test]
+fn turned_text_follows_the_same_overflow_rules() {
+    let out = std::env::temp_dir().join("render-overflow-turned.png");
+    let mut request = text_request(LONG, 3.2, "error", serde_json::json!({"rotation_deg": 90}));
+    request["document"]["schema_version"] = serde_json::json!(2);
+    let (code, report) = run(&request, out.to_str().unwrap());
+    assert_eq!((code, report["code"].as_str(), report["element"].as_str()), (3, Some("TEXT_OVERFLOW"), Some("name")), "{report}");
+
+    let mut request = text_request(LONG, 8.0, "ellipsis", serde_json::json!({"rotation_deg": 90}));
+    request["document"]["schema_version"] = serde_json::json!(2);
+    let (code, report) = run(&request, out.to_str().unwrap());
+    assert_eq!(code, 0, "a turned box ellipsises too: {report}");
+}
