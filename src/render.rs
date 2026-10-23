@@ -182,24 +182,46 @@ pub fn render(input: &Value, assets: &[(String, Vec<u8>)], _version: &str) -> Re
         let overflow = element["overflow"].as_str().unwrap_or("error");
         let wrap = element["wrap"].as_bool().unwrap_or(true);
         let box_width = geometry.x(number(element, "width_mm"));
+        // The box is bounded down as well as across. Lines are laid out from the top of the
+        // box one line advance apart, the first baseline one advance down (text_svg), so n
+        // lines need n advances; half a pixel of slack absorbs the millimetre rounding.
+        let box_height = geometry.y(number(element, "height_mm")) + 0.5;
+        let spacing = number(element, "line_spacing");
 
         let (lines, used) = loop {
             let font_px = size_pt * geometry.dpi_x / POINTS_PER_INCH;
+            let line_height = size_pt * geometry.dpi_y / POINTS_PER_INCH * spacing;
             let lines = break_lines(&text, &family, font_px, &fontdb, box_width, wrap);
-            let fits = lines.iter().all(|line| measure(line, &family, font_px, &fontdb) <= box_width);
-            if fits {
+            let fits_across = lines.iter().all(|line| measure(line, &family, font_px, &fontdb) <= box_width);
+            let fits_down = line_height * lines.len() as f32 <= box_height;
+            if fits_across && fits_down {
                 break (lines, size_pt);
             }
+            let room = (box_height / line_height).floor() as usize;
             match (overflow, minimum) {
                 ("shrink_to_fit", Some(floor)) if size_pt - 0.5 >= floor => size_pt -= 0.5,
-                ("ellipsis", _) => break (ellipsise(&text, &family, size_pt * geometry.dpi_x / POINTS_PER_INCH, &fontdb, box_width), size_pt),
+                ("ellipsis", _) if room >= 1 => {
+                    // Too wide keeps the single ellipsised line it always produced. Too many
+                    // lines keeps the ones that fit, and the last of them ends the text.
+                    if !fits_across {
+                        break (ellipsise(&text, &family, font_px, &fontdb, box_width), size_pt);
+                    }
+                    let mut kept: Vec<String> = lines[..room - 1].to_vec();
+                    kept.push(ellipsise(&lines[room - 1..].join(" "), &family, font_px, &fontdb, box_width).remove(0));
+                    break (kept, size_pt);
+                }
+                _ if !fits_across => {
+                    return Err(fail("TEXT_OVERFLOW", Some(id),
+                        format!("{text:?} does not fit a {:.1} mm wide box at {size_pt} pt", number(element, "width_mm"))))
+                }
                 _ => {
                     return Err(fail("TEXT_OVERFLOW", Some(id),
-                        format!("{text:?} does not fit a {:.1} mm box at {size_pt} pt", number(element, "width_mm"))))
+                        format!("{text:?} needs {} line(s), {:.1} mm, at {size_pt} pt and the box is {:.1} mm tall",
+                            lines.len(), line_height * lines.len() as f32 * MM_PER_INCH / geometry.dpi_y, number(element, "height_mm"))))
                 }
             }
         };
-        laid_out.push((index, lines, used, number(element, "line_spacing")));
+        laid_out.push((index, lines, used, spacing));
     }
 
     let height = if quarter {
@@ -262,12 +284,9 @@ pub fn render(input: &Value, assets: &[(String, Vec<u8>)], _version: &str) -> Re
             "rect" => paint_rect(&mut piece, &frame, &at_origin, colour, permits_red)?,
             "image" => paint_image(&mut piece, &frame, &at_origin, assets, colour)?,
             "text" => {
+                // Bounded down at layout, in the element's own frame, like upright text.
                 let (_, lines, size_pt, spacing) = laid_out.iter().find(|(i, ..)| *i == index)
                     .ok_or_else(|| fail("RENDER_FAILED", Some(id), "the text was not laid out"))?;
-                let line_height = size_pt * frame.dpi_y / POINTS_PER_INCH * spacing;
-                if line_height * lines.len() as f32 > h as f32 + 0.5 {
-                    return Err(fail("TEXT_OVERFLOW", Some(id), format!("{} lines do not fit a turned {:.1} mm box", lines.len(), number(element, "height_mm"))));
-                }
                 let one = [at_origin];
                 let svg = text_svg(&frame, h, &one, &[(0, lines.clone(), *size_pt, *spacing)], &families, fields, permits_red)?;
                 draw_svg(&mut piece, &svg, &fontdb)?;

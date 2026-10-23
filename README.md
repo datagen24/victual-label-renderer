@@ -64,3 +64,19 @@ bit depth rather than merely "PNG", because without that the same name spans art
 differing by an order of magnitude in size and by whether the worker has to quantise before
 it can send. `tiny_skia`'s own `save_png` writes RGBA8 — 37,145 bytes where the indexed
 encoding of identical pixels is 2,573 — so the encoder here is the renderer's own.
+
+## Text that does not fit
+
+A text element's box bounds it across and down. Lines start at the top of the box, one line
+advance (`size_pt × line_spacing`) apart, with the first baseline one advance down, so `n`
+lines need `n` advances of height. When the value does not fit, `overflow` decides:
+
+- `error` refuses the render with `TEXT_OVERFLOW`, naming the element and saying whether
+  the value was too wide or needed too many lines.
+- `ellipsis` keeps the lines that fit and ends the last one with `…`. A value too wide for
+  the box becomes one ellipsised line, as before. A box too short for one line refuses.
+- `shrink_to_fit` steps the size down by 0.5 pt until the value fits both ways, and refuses
+  at `min_size_pt`.
+
+Until 2026-10-23 only a turned box was bounded down, and only under `error`. An upright box
+drew every line it needed over whatever sat below it.
